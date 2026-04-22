@@ -4,7 +4,6 @@ import { Helpers } from '../utils/helpers';
 import { Transcriber } from '../transcription/transcriber';
 import type { AllowedLanguages, AudioOriginalLangAllowed, TranscriptionDataTypes } from '../types';
 import { Formatter } from '../transcription/formatter';
-import { TextTranslator } from '../transcription/textTranslator';
 import { Spleeter } from '../separator/spleeter';
 import { SpeechGenerator } from '../speech/speechGenerator';
 import { Adaptation } from '../smart-sync/adaptation';
@@ -13,6 +12,98 @@ import fsPromises from 'fs/promises';
 import fs from 'fs';
 import { Lipsync } from '../lipsync/lipsync';
 import crypto from 'crypto';
+import path from 'path';
+import readline from 'readline/promises';
+
+const createManualTranslationDraft = ({
+  transcription,
+  targetLanguage,
+  originLanguage,
+  transcriptionSummary,
+}: {
+  transcription: Awaited<ReturnType<typeof Formatter.formatTranscription>>;
+  targetLanguage: AllowedLanguages;
+  originLanguage: AudioOriginalLangAllowed;
+  transcriptionSummary: string;
+}) => {
+  return {
+    meta: {
+      createdAt: new Date().toISOString(),
+      sourceLanguage: originLanguage,
+      targetLanguage,
+      transcriptionSummary,
+      instructions:
+        'Translate each segment.transcription value to the targetLanguage and keep all existing fields unchanged.',
+    },
+    segments: transcription,
+  };
+};
+
+const waitForManualTranslation = async ({
+  transcription,
+  targetLanguage,
+  originLanguage,
+  transcriptionSummary,
+}: {
+  transcription: Awaited<ReturnType<typeof Formatter.formatTranscription>>;
+  targetLanguage: AllowedLanguages;
+  originLanguage: AudioOriginalLangAllowed;
+  transcriptionSummary: string;
+}) => {
+  const draftFilePath = path.join(
+    process.cwd(),
+    'temporary-files',
+    `translation-draft-${crypto.randomUUID()}.json`,
+  );
+
+  await fsPromises.mkdir(path.dirname(draftFilePath), { recursive: true });
+
+  const translationDraft = createManualTranslationDraft({
+    transcription,
+    targetLanguage,
+    originLanguage,
+    transcriptionSummary,
+  });
+
+  await fsPromises.writeFile(draftFilePath, JSON.stringify(translationDraft, null, 2), 'utf-8');
+
+  console.info('OpenAI translation step skipped: manual translation mode enabled.');
+  console.info(`Translation file created: ${draftFilePath}`);
+  console.info('Translate the file and save changes, then type "continue" to proceed.');
+
+  const cli = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    while (true) {
+      const answer = (await cli.question('> ')).trim().toLowerCase();
+
+      if (answer === 'continue') {
+        break;
+      }
+
+      console.info('Unknown command. Please type "continue" when translation is ready.');
+    }
+  } finally {
+    cli.close();
+  }
+
+  const translatedFileContent = await fsPromises.readFile(draftFilePath, 'utf-8');
+  const parsedDraft = JSON.parse(translatedFileContent) as {
+    segments?: unknown;
+  };
+
+  if (!Array.isArray(parsedDraft.segments)) {
+    throw new Error(`Translated file ${draftFilePath} does not contain a valid "segments" array.`);
+  }
+
+  return {
+    draftFilePath,
+    translatedSegments: parsedDraft.segments,
+  };
+};
 
 export type DebugMode = 'yes' | 'no';
 export type NumberOfSpeakers = 'auto-detect' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '10';
@@ -81,16 +172,16 @@ export const translate = async () => {
       transcriptionData.detectedAudioLanguage,
     );
 
-    const translatedTranscription = await TextTranslator.translateTranscriptionInTargetLanguage({
+    const { draftFilePath, translatedSegments } = await waitForManualTranslation({
       transcription: formattedTranscription,
       targetLanguage,
       originLanguage: transcriptionData.detectedAudioLanguage,
       transcriptionSummary: transcriptionSummary || '',
     });
 
-    const verifiedTranscription = Helpers.parseAndVerifyTranscriptionDetails(
-      JSON.stringify(translatedTranscription),
-    );
+    const verifiedTranscription = Helpers.parseAndVerifyTranscriptionDetails(JSON.stringify(translatedSegments));
+
+    console.info(`Manual translation loaded from: ${draftFilePath}`);
 
     ({ backgroundAudio, vocalsIsolated } = await Spleeter.getSeparateAudio(audioPathWithoutVideo));
     const isolatedVocalsAverageDecibel = await AudioUtils.getAverageDecibel(vocalsIsolated);
